@@ -3,6 +3,7 @@
     [com.fulcrologic.rad.attributes :as attr]
     [com.fulcrologic.rad.database-adapters.sql :as rsql]
     [com.fulcrologic.rad.database-adapters.sql.query :as query]
+    [com.fulcrologic.rad.database-adapters.sql.vendor :as vendor]
     [com.fulcrologic.rad.database-adapters.sql.migration :as mig]
     [com.fulcrologic.rad.database-adapters.test-helpers.attributes :as attrs]
     [clojure.string :as str]
@@ -76,7 +77,7 @@
         id4 (ids/new-uuid 4)
         ds  (jdbc/get-datasource {:dbtype "h2:mem"})]
     (with-open [c (.getConnection ds)]
-      (doseq [s (mig/automatic-schema :production attrs/all-attributes)]
+      (doseq [s (mig/automatic-schema :production (vendor/->H2Adapter) attrs/all-attributes)]
         (log/info s)
         (jdbc/execute! c [s]))
       (sql/insert! c "accounts" {:id id2 :name "sam"})
@@ -91,14 +92,14 @@
           attrs/account-id
           [:account/name {:account/addresses [:address/street]}]
           {:account/id id1})
-        => {:account/id id1 :account/name "joe" :account/addresses []}
+        => {:account/id id1 :account/name "joe"}
         "Can resolve a batch query"
         (query/eql-query! {::attr/key->attribute   key->attribute
                            ::rsql/connection-pools {:production c}}
           attrs/account-id
           [:account/name {:account/addresses [:address/street]}]
           [{:account/id id1}])
-        => [{:account/id id1 :account/name "joe" :account/addresses []}]
+        => [{:account/id id1 :account/name "joe"}]
         "Can resolve to-one forward refs"
         (query/eql-query! {::attr/key->attribute   key->attribute
                            ::rsql/connection-pools {:production c}}

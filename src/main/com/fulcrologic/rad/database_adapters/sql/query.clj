@@ -7,7 +7,7 @@
   - Persisting data based off submitted form deltas"
   (:require
     [com.fulcrologic.rad.attributes :as attr]
-    [com.fulcrologic.rad.database-adapters.sql :as rsql]
+    [com.fulcrologic.rad.database-adapters.sql :as rad.sql]
     [com.fulcrologic.rad.database-adapters.sql.schema :refer [column-name table-name]]
     [com.fulcrologic.fulcro.algorithms.do-not-use :refer [deep-merge]]
     [clojure.string :as str]
@@ -25,6 +25,7 @@
 
 (defn q [v]
   (cond
+    (nil? v) nil
     (int? v) v
     (boolean? v) v
     :else (str "'" v "'")))
@@ -32,7 +33,8 @@
 (>defn to-many-join-column-query
   [{::attr/keys [key->attribute] :as env} {::attr/keys [target cardinality identities qualified-key] :as attr} ids]
   [any? ::attr/attribute coll? => (? (s/tuple string? ::attr/attributes))]
-  (when (= :many cardinality)
+  (log/spy :debug qualified-key)
+  (when (= :many (log/spy :debug cardinality))
     (do
       (when (not= 1 (count identities))
         (throw (ex-info "Reference column must have exactly 1 ::attr/identities entry." {:k qualified-key})))
@@ -43,7 +45,6 @@
                    column              (column-name key->attribute attr) ; account_addresses_account_id
                    table               (table-name key->attribute target-attr) ; address
                    target-id-column    (column-name target-attr) ; id
-
                    id-list             (str/join "," (map q ids))]
         [(format "SELECT %1$s.%2$s AS c0, array_agg(%3$s.%4$s) AS c1 FROM %1$s LEFT JOIN %3$s ON %1$s.%2$s = %3$s.%5$s WHERE %1$s.%2$s IN (%6$s) GROUP BY %1$s.%2$s"
            rev-target-table rev-target-column table target-id-column column id-list)
@@ -64,15 +65,23 @@
         id-list     (str/join "," (map q ids))]
     [(format "SELECT %s FROM %s WHERE %s IN (%s)" columns table id-column id-list) table-attrs]))
 
-(defn- interpret-result [value {::attr/keys [cardinality type target]}]
+(defn sql->form-value [{::attr/keys    [type]
+                        ::rad.sql/keys [sql->form-value]} sql-value]
   (cond
-    (and (= :ref type) (not= :many cardinality))
-    {target value}
+    sql->form-value (sql->form-value sql-value)
+    (and (= type :enum) (string? sql-value) (str/starts-with? sql-value ":")) (read-string (log/spy :debug sql-value))
+    :else sql-value))
 
-    (= :ref type)
-    (mapv (fn [id] {target id}) value)
+(defn- interpret-result [value {::attr/keys [cardinality type target] :as attr}]
+  (when (not (nil? value))
+    (cond
+      (and (= :ref type) (not= :many cardinality))
+      (log/spy :info {target value})
 
-    :else value))
+      (= :ref type)
+      (vec (keep (fn [id] (when id {target id})) value))
+
+      :else (sql->form-value attr value))))
 
 (defn- convert-row [row attrs]
   (when-not (contains? row :c0)
@@ -82,7 +91,9 @@
       (fn [{:keys [index result]} {::attr/keys [qualified-key] :as attr}]
         (let [value (interpret-result (get row (keyword (str "c" index))) attr)]
           {:index  (inc index)
-           :result (assoc result qualified-key value)}))
+           :result (if (nil? value)
+                     result
+                     (assoc result qualified-key value))}))
       {:index  0
        :result {}}
       attrs)))
@@ -120,9 +131,9 @@
 (def row-builder (rs/as-maps-adapter rs/as-unqualified-lower-maps RAD-column-reader))
 
 (>defn eql-query!
-  [{::attr/keys [key->attribute]
-    ::rsql/keys [connection-pools]
-    :as         env} id-attribute eql-query resolver-input]
+  [{::attr/keys    [key->attribute]
+    ::rad.sql/keys [connection-pools]
+    :as            env} id-attribute eql-query resolver-input]
   [any? ::attr/attribute ::eql/query coll? => (? coll?)]
   (let [schema            (::attr/schema id-attribute)
         datasource        (or (get connection-pools schema) (throw (ex-info "Data source missing for schema" {:schema schema})))
@@ -131,20 +142,19 @@
         to-many-joins     (filterv #(and (= :many (::attr/cardinality %))
                                       (= :ref (::attr/type %))) attrs-of-interest)
         ids               (if (map? resolver-input)
-                            [(or (get resolver-input id-key) (log/error "Resolver input missing ID" {:input resolver-input, :expected-key id-key}))]
-                            (mapv #(or (get % id-key)
-                                     (log/error ex-info "Resolver input missing ID" {:input resolver-input, :expected-key id-key})) resolver-input))
-        [base-query base-attributes] (base-property-query env id-attribute attrs-of-interest ids)
-        joins-to-run      (mapv #(to-many-join-column-query env % ids) to-many-joins)
-        one?              (map? resolver-input)]
+                            (if-let [id (get resolver-input id-key)] [id] [])
+                            (vec (keep #(get % id-key) resolver-input)))]
     (when (seq ids)
-      (let [rows                  (sql/query datasource [base-query] {:builder-fn row-builder})
-            base-result-map-by-id (enc/keys-by id-key (sql-results->edn-results rows base-attributes))
+      (let [[base-query base-attributes] (base-property-query env id-attribute attrs-of-interest ids)
+            joins-to-run          (mapv #(to-many-join-column-query env % ids) to-many-joins)
+            one?                  (map? resolver-input)
+            rows                  (log/spy :debug (sql/query datasource (log/spy :debug [base-query]) {:builder-fn row-builder}))
+            base-result-map-by-id (log/spy :debug (enc/keys-by id-key (log/spy :debug (sql-results->edn-results rows base-attributes))))
             results-by-id         (reduce
                                     (fn [result [join-query join-attributes]]
-                                      (let [join-rows         (sql/query datasource [join-query] {:builder-fn row-builder})
-                                            join-eql-results  (sql-results->edn-results join-rows join-attributes)
-                                            join-result-by-id (enc/keys-by id-key join-eql-results)]
+                                      (let [join-rows         (log/spy :debug (sql/query datasource [join-query] {:builder-fn row-builder}))
+                                            join-eql-results  (log/spy :debug (sql-results->edn-results join-rows join-attributes))
+                                            join-result-by-id (log/spy :debug (enc/keys-by id-key join-eql-results))]
                                         (deep-merge result join-result-by-id)))
                                     base-result-map-by-id
                                     joins-to-run)]
